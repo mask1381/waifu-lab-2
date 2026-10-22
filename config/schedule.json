@@ -1,0 +1,27 @@
+{
+  "timezone": "Asia/Tehran",
+  "lead_minutes": 10,
+  "window_hours": 24,
+  "max_scheduled": 95,
+  "pool_pages": 2,
+  "slot_tolerance_minutes": 5,
+  "fallback_types": {
+    "zip": ["album"],
+    "telegraph": ["album"],
+    "album": []
+  },
+  "slots": [
+    {"time": "00:00", "type": "album"},
+    {"time": "02:00", "type": "album"},
+    {"time": "04:00", "type": "album"},
+    {"time": "06:00", "type": "telegraph"},
+    {"time": "08:00", "type": "album"},
+    {"time": "10:00", "type": "zip"},
+    {"time": "12:00", "type": "album"},
+    {"time": "14:00", "type": "album"},
+    {"time": "16:00", "type": "album"},
+    {"time": "18:00", "type": "telegraph"},
+    {"time": "20:00", "type": "album"},
+    {"time": "22:00", "type": "zip"}
+  ]
+}
