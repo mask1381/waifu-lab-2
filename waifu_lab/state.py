@@ -1,7 +1,66 @@
 from __future__ import annotations
 
+import json
+import os
 import random
+import re
+import tempfile
 from datetime import date
+from pathlib import Path
+
+_LEGACY = re.compile(r"^(\d+)_p\d+$")
+
+
+def _atomic_write(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def load_runtime(path: Path) -> dict:
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) or {}
+        except json.JSONDecodeError:
+            data = {}
+    data.setdefault("recentlyUsed", [])
+    data.setdefault("recentCaptions", {})
+    data.setdefault("failures", {})
+    return data
+
+
+def save_runtime(path: Path, data: dict) -> None:
+    _atomic_write(path, data)
+
+
+def load_posted(path: Path) -> dict[str, str]:
+    posted: dict[str, str] = {}
+    if not path.exists():
+        return posted
+    try:
+        ids = (json.loads(path.read_text(encoding="utf-8")) or {}).get("ids", [])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{path} is corrupt: {exc}") from exc
+    for i in ids:
+        i = str(i)
+        posted[i] = ""
+        m = _LEGACY.match(i)
+        if m:
+            posted.setdefault(f"pixiv:{m.group(1)}", "")
+    return posted
+
+
+def save_posted(path: Path, posted: dict[str, str]) -> None:
+    _atomic_write(path, {"ids": sorted(posted)})
 
 
 def select_artist(artists: list[dict], runtime: dict) -> dict:
@@ -36,7 +95,7 @@ class State:
         self._synced = dict(self._posted)
         self.sink = sink
         self.dry = dry
-        self.stats: dict[str, list] = {}   # tag -> [translation, count, nsfw, status, used, last_seen]
+        self.stats: dict[str, list] = {}
 
     def posted(self) -> dict:
         return self._posted
@@ -45,7 +104,6 @@ class State:
         return self._runtime
 
     def save(self, posted, runtime) -> None:
-        """Called after every finished post: only new/changed posted ids are sent now."""
         if runtime is not None:
             self._runtime = runtime
         if posted is None or self.dry or not self.sink:
@@ -67,7 +125,6 @@ class State:
             row[4] += 1 if d["used"] else 0
 
     def flush(self) -> None:
-        """End of run: remaining posted ids, runtime, tag stats."""
         if self.dry or not self.sink:
             return
         self.save(self._posted, self._runtime)
