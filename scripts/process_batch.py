@@ -127,7 +127,6 @@ def send_log(chat, header: str, limit: int) -> None:
 
 
 def run(batch: dict, sink: AckSink) -> int:
-    from waifu_lab import pipeline
     from waifu_lab.config import env_config
     from waifu_lab.plan import run_plan
     from waifu_lab.state import State
@@ -136,8 +135,9 @@ def run(batch: dict, sink: AckSink) -> int:
     state = State(batch.get("posted"), batch.get("runtime"), sink, dry=cfg["dry_run"])
     cfg["state"] = state
     try:
-        if batch.get("mode") == "post":
-            return pipeline.run_round(cfg)
+        if batch.get("mode") == "manual":
+            from waifu_lab.plan import run_manual
+            return run_manual(cfg, batch)
         return run_plan(cfg, cfg["dry_run"])
     finally:
         state.flush()

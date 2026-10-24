@@ -102,7 +102,7 @@ def list_scheduled(chat_id: str) -> list[dict]:
 
 # ---- album ----
 
-async def _album(chat_id: str, blobs: list[bytes], caption: str, when: datetime) -> list[int]:
+async def _album(chat_id: str, blobs: list[bytes], caption: str, when: datetime | None) -> list[int]:
     async with _session(chat_id) as (client, entity):
         ids: list[int] = []
         try:
@@ -112,7 +112,7 @@ async def _album(chat_id: str, blobs: list[bytes], caption: str, when: datetime)
                     bio = io.BytesIO(blobs[k])
                     bio.name = f"page_{k + 1}.jpg"
                     files.append(bio)
-                at = _utc(when + timedelta(seconds=CHUNK_GAP * i))
+                at = _utc(when + timedelta(seconds=CHUNK_GAP * i)) if when else None
                 if len(files) == 1:
                     res = await client.send_file(entity, files[0], caption=caption, parse_mode="html", schedule=at)
                 else:
@@ -122,10 +122,28 @@ async def _album(chat_id: str, blobs: list[bytes], caption: str, when: datetime)
         except Exception:
             await _delete(client, entity, ids)
             raise
-        log.info("Album scheduled for %s (%s messages)", when.strftime("%m-%d %H:%M"), len(ids))
+        log.info("Album %s (%s messages)", when.strftime("%m-%d %H:%M") if when else "sent now", len(ids))
         return ids
 
 
-def schedule_album(chat_id: str, blobs: list[bytes], caption: str, when: datetime) -> list[int]:
-    """Schedule photos as one or more balanced albums, same caption on the first photo of each."""
+def schedule_album(chat_id: str, blobs: list[bytes], caption: str, when: datetime | None = None) -> list[int]:
+    """Schedule photos as one or more balanced albums, same caption on the first photo of each.
+
+    when=None sends immediately instead of scheduling.
+    """
     return _retry(lambda: _album(chat_id, blobs, caption, when), "Scheduling album")
+
+
+# ---- text ----
+
+async def _text(chat_id: str, text: str, when: datetime | None) -> list[int]:
+    async with _session(chat_id) as (client, entity):
+        res = await client.send_message(
+            entity, text, parse_mode="html", link_preview=False, schedule=_utc(when) if when else None
+        )
+        return _ids(res)
+
+
+def schedule_text(chat_id: str, text: str, when: datetime | None) -> list[int]:
+    """Text-only post (used when an NSFW post has no SFW cover at all)."""
+    return _retry(lambda: _text(chat_id, text, when), "Scheduling text")

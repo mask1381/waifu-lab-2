@@ -5,40 +5,23 @@ from typing import Any
 
 # Baseline. An artist entry in sources.json overrides only the keys it sets (deep merge).
 DEFAULT_RULES: dict[str, Any] = {
+    "nsfw_cover": "own",        # own | sfw
+    "cover_page": "auto",       # auto | first | last | int
+    "merge_with": [],           # user_id هنرمندهایی که NSFW کم‌صفحه‌شان با هم ترکیب می‌شود
+    "sfw_fallback": [],         # user_id هنرمندهایی که اگر SFW نداشت از آن‌ها کاور SFW می‌آید
+    "zip": None,                # {"pages": "all"} = zip فعال
+    "document": False,          # True = فایل‌های مخزن به صورت سند اصلی
+    "hd_link": True,            # لینک HD برای SFW تک‌عکس
+    "pages": {"drop_last": False, "merge_singles": None},
+    "schedule": {"preferred_slots": None},
+    "spoiler": False,
     "hashtags": {
         "max_category": 4,
-        "format_tag": True,  # #ZIP / #Gallery
+        "format_tag": True,
         "passthrough": {"sfw": True, "nsfw": True, "max": 2, "max_nsfw": 1},
     },
-    "pages": {"drop_last": False, "merge_singles": None},  # merge_singles: {"min":4,"max":10,"max_wait_days":3}
-    "schedule": {"preferred_slots": None},                 # ["12:30", "00:30"] = فقط در این اسلات‌ها
-    "spoiler": False,  # spoiler on the zip / gallery cover photo
-    "delivery": {
-        "mode": "auto",  # auto | zip | album | telegraph  (forced for every post)
-        "allowed": ["telegraph", "zip", "album"],  # methods the auto logic may pick
-        "sfw_telegraph_min_pages": None,  # SFW با این تعداد صفحه یا بیشتر -> telegraph
-        "nsfw_zip_min_pages": 5,  # NSFW: pages >= this -> zip, fewer -> telegraph
-        "telegraph": {
-            # "telegraph" is the gallery method: a cover photo plus one storage-bot link per part.
-            # Each part goes to storage as a zip, or as a media group when zip is not allowed.
-            "min_pages_over_album": 11,  # only when zip is not allowed: >= this -> gallery, else album
-            "cover_page": "first",  # which page is the cover photo (first | last | 1-based int)
-            "part_size": 10,  # pages per gallery part / zip (1..10, Telegram media-group limit)
-        },
-        # what to try when a method fails (zip is never used for SFW)
-        "fallback": {"telegraph": ["zip", "album"], "zip": [], "album": []},
-        # check that Telegram really built Instant View before sending a Telegraph post
-        "verify": {
-            "telegraph": {
-                "enabled": True,
-                "enforce": False,        # False = send the best page even if none passed; True = failed -> next method
-                "min_photo_ratio": 0.0,  # raise to e.g. 1.0 once the logs show real numbers
-                "retries": 3,
-                "wait": 3.0,
-            },
-        },
-    },
 }
+ALLOWED_KEYS = set(DEFAULT_RULES) | {"caption", "image_edit"}
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -53,8 +36,16 @@ def deep_merge(base: dict, override: dict) -> dict:
 
 
 def resolve_rules(artist: dict) -> dict:
-    """Effective rules = DEFAULT_RULES deep-merged with artist['rules']."""
-    return deep_merge(DEFAULT_RULES, artist.get("rules") or {})
+    """Unknown/legacy keys (delivery.*, zip.enabled ...) are dropped on purpose."""
+    own = {k: v for k, v in (artist.get("rules") or {}).items() if k in ALLOWED_KEYS}
+    return deep_merge(DEFAULT_RULES, own)
+
+
+def zip_enabled(rules: dict | None) -> bool:
+    return isinstance((rules or {}).get("zip"), dict)
+
+
+zip_allowed = zip_enabled  # alias for old imports
 
 
 def get_rule(rules: dict, *path: str, default: Any = None) -> Any:
@@ -65,28 +56,6 @@ def get_rule(rules: dict, *path: str, default: Any = None) -> Any:
             return default
         cur = cur[key]
     return cur
-
-
-def zip_allowed(rules: dict | None) -> bool:
-    """Whether a zip may be built for this artist at all.
-
-    Single source of truth for zip permission: both conditions must hold.
-      - "zip" is in delivery.allowed (a missing/empty list means every method is allowed,
-        which is how delivery._allowed() reads it)
-      - zip.enabled is not False
-    """
-    rules = rules or {}
-    if get_rule(rules, "zip", "enabled", default=True) is False:
-        return False
-    allowed = get_rule(rules, "delivery", "allowed", default=None)
-    if not allowed:
-        return True
-    if isinstance(allowed, str):
-        return allowed == "zip"
-    try:
-        return "zip" in allowed
-    except TypeError:
-        return False
 
 
 def _page_index(spec: Any, n: int) -> int | None:

@@ -14,7 +14,7 @@ from waifu_lab.config import DATA_DIR
 log = logging.getLogger(__name__)
 
 BRAND_TAG = "#WaifuLab"
-FORMAT_TAGS = {"zip": "#ZIP", "telegraph": "#Gallery"}
+FORMAT_TAGS = {"zip": "#ZIP", "bot": "#Gallery"}
 BRAND_TAG = "#WaifuLab"
 JP_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 PAREN_RE = re.compile(r"^(?P<head>[^()]+?)\s*\((?P<inside>[^()]+)\)\s*$")
@@ -105,6 +105,8 @@ def load_adult_set(path: Path) -> set[str]:
 def load_drop_set(path: Path) -> set[str]:
     """drop_tags.csv -> junk tags that are silently removed (AI, generic, R-18 ...)."""
     return _read_tag_column(path)
+
+
 _SEP = re.compile(r"[\s_\-./:'’]+")
 _FILTERS: dict | None = None
 
@@ -150,6 +152,7 @@ def pass_blocked(ht: str, text: str, name: str, en: str, opts: dict) -> bool:
     compact = _SEP.sub("", raw)
     f = get_filters()
     return any(s in compact for s in f["stems"]) or any(rx.search(raw) for rx in f["regexes"])
+
 
 def _ns_order(maps):
     return [

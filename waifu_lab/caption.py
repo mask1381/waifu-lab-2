@@ -19,8 +19,9 @@ Every CTA line is one big hyperlink (emoji + text), so it is easy to tap.
 Title and teaser are picked once per post (caption_parts) and reused if delivery
 falls back to another format, so the caption never changes its wording mid-post.
 
-"telegraph" is the gallery format: the post is a cover photo and the links are
-one "Get the album" line per storage album (bot deep links).
+"bot" is the gallery format: the post is a cover photo and the links are
+one "Get the album" line per storage album (bot deep links). "hd" is a single
+original-quality file.
 """
 
 import html
@@ -34,7 +35,7 @@ from waifu_lab.tags import BRAND_TAG, FORMAT_TAGS
 
 log = logging.getLogger(__name__)
 
-FORMATS = ("zip", "album", "telegraph")
+FORMATS = ("zip", "album", "bot", "hd")
 CAPTION_LIMIT = 1024  # Telegram limit for photo / album captions (visible characters)
 
 WAIFU_LAB_URL = "https://t.me/+Nt8As_Mw1l0yMGY0"
@@ -94,7 +95,11 @@ def _cta(fmt: str, count: int, page_url: str | list[str] | None) -> str:
         if isinstance(page_url, str) and page_url:
             return _link(page_url, "📦 Full quality ZIP 👉 Tap to get")
         return "📦 Full quality ZIP below 👇"
-    if fmt == "telegraph":
+    if fmt == "hd":
+        if isinstance(page_url, str) and page_url:
+            return _link(page_url, "🖼 Original quality 👉 Tap to get")
+        return "🖼 Original quality below 👇"
+    if fmt == "bot":
         # page_url = list of storage bot deep links, one per album part
         if isinstance(page_url, str):
             links = [page_url]
@@ -134,12 +139,12 @@ def build_caption(
     info: dict | None = None,
     page_url: str | list[str] | None = None,
 ) -> str:
-    """Caption for one delivery format (zip | album | telegraph).
+    """Caption for one delivery format (zip | album | bot | hd).
 
     count    - number of pages in the post
     hashtags - classify_tags()["hashtags"] (franchise, characters, category, brand)
     info     - classify_tags() result; used to protect important hashtags when trimming
-    page_url - zip: storage bot deep link (str); telegraph: list of storage bot deep links
+    page_url - zip / hd: storage bot deep link (str); bot: list of storage bot deep links
     """
     if fmt not in FORMATS:
         raise ValueError(f"Unknown caption format {fmt!r}")

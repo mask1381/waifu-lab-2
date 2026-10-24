@@ -29,7 +29,7 @@ DEFAULT_BOT_USERNAME = "littlemask02_bot"
 BOT_REPLY_TIMEOUT = 45.0   # the bot usually answers in ~5s
 BOT_POLL_INTERVAL = 2.0
 STORAGE_ATTEMPTS = 2
-GALLERY_PART_SIZE = 10     # Telegram media-group limit: one zip per album part
+GALLERY_PART_SIZE = 10     # Telegram media-group limit
 
 
 def userbot_configured() -> bool:
@@ -200,16 +200,6 @@ def split_parts(pages: list[dict], size: int = GALLERY_PART_SIZE) -> list[list[d
     return [pages[i:i + size] for i in range(0, len(pages), size)]
 
 
-def gallery_part_size(rules: dict | None) -> int:
-    """Pages per gallery part: 1..10, from delivery.telegraph.part_size."""
-    raw = get_rule(rules or {}, "delivery", "telegraph", "part_size", default=GALLERY_PART_SIZE)
-    try:
-        size = int(raw)
-    except (TypeError, ValueError):
-        size = GALLERY_PART_SIZE
-    return min(GALLERY_PART_SIZE, max(1, size))
-
-
 # ---- telethon helpers ----
 
 async def _resolve_entity(client, chat_id: int):
@@ -352,7 +342,9 @@ async def _wait_for_bot_link(client, entity, sent_ids: int | list[int], pattern:
     return None
 
 
-async def _to_storage(client, entity, paths: list[Path], label: str = "") -> StorageUpload:
+async def _to_storage(
+    client, entity, paths: list[Path], label: str = "", force_document: bool = False
+) -> StorageUpload:
     """Upload one message (one zip, or a media group of pages) and wait for the bot's link.
 
     Deletes the message(s) if the bot stays silent.
@@ -366,7 +358,7 @@ async def _to_storage(client, entity, paths: list[Path], label: str = "") -> Sto
             log.info("Storage upload %s%s%%", f"{label} " if label else "", pct)
 
     payload = str(paths[0]) if len(paths) == 1 else [str(p) for p in paths]
-    as_document = len(paths) == 1 and paths[0].suffix.lower() == ".zip"
+    as_document = force_document or (len(paths) == 1 and paths[0].suffix.lower() == ".zip")
     sent = await client.send_file(entity, payload, force_document=as_document, progress_callback=progress)
     msgs = sent if isinstance(sent, (list, tuple)) else [sent]
     ids = [int(m.id) for m in msgs]
@@ -383,7 +375,7 @@ async def _to_storage(client, entity, paths: list[Path], label: str = "") -> Sto
     return StorageUpload(link=link, file_id=primary, reply_id=reply_id, message_ids=ids)
 
 
-async def _upload_all(batches: list[list[Path]]) -> list[StorageUpload]:
+async def _upload_all(batches: list[list[Path]], force_document: bool = False) -> list[StorageUpload]:
     """Upload a whole batch in one session; roll every upload back if any of them fails."""
     from telethon import TelegramClient
     from telethon.sessions import StringSession
@@ -401,7 +393,9 @@ async def _upload_all(batches: list[list[Path]]) -> list[StorageUpload]:
         entity = await _resolve_entity(client, int(os.environ["STORAGE_CHAT_ID"].strip()))
         try:
             for index, paths in enumerate(batches, start=1):
-                uploads.append(await _to_storage(client, entity, paths, f"{index}/{len(batches)}"))
+                uploads.append(
+                    await _to_storage(client, entity, paths, f"{index}/{len(batches)}", force_document)
+                )
         except Exception:
             ids = [mid for u in uploads for mid in u.all_ids()]
             if ids:
@@ -416,14 +410,14 @@ async def _upload_all(batches: list[list[Path]]) -> list[StorageUpload]:
         await client.disconnect()
 
 
-def _upload_batch(batches: list[list[Path]]) -> list[StorageUpload]:
+def _upload_batch(batches: list[list[Path]], force_document: bool = False) -> list[StorageUpload]:
     """Upload one message per batch (a zip or a media group)."""
     if not batches:
         raise ValueError("Nothing to upload")
     last_error: Exception | None = None
     for attempt in range(1, STORAGE_ATTEMPTS + 1):
         try:
-            return asyncio.run(_upload_all(batches))
+            return asyncio.run(_upload_all(batches, force_document))
         except Exception as exc:
             last_error = exc
             log.warning("Storage upload failed (try %s/%s): %s", attempt, STORAGE_ATTEMPTS, exc)
@@ -454,38 +448,28 @@ def send_gallery_to_storage(
     pages: list[dict],
     workdir: Path,
     base_name: str,
-    part_size: int = GALLERY_PART_SIZE,
     rules: dict | None = None,
 ) -> list[str]:
-    """Upload every gallery part to storage. Returns one deep link per part.
+    """Upload pages to the storage chat as media groups (max 10, balanced). One deep link per part.
+    Files are originals-as-documents only when the artist has document=true."""
+    from waifu_lab.telegram import split_balanced
 
-    Each part is one storage message: a zip when the artist allows zip, otherwise a
-    media group of the original files. Zip is never built when the rules forbid it.
-
-    Everything is built and uploaded before the channel sees anything; if one part fails,
-    the storage uploads are rolled back so the caller can fall back without leaving orphans.
-    """
-    parts = split_parts(pages, part_size)
-    use_zip = zip_allowed(rules)
-    if use_zip:
-        batches: list[list[Path]] = [
-            [
-                build_zip(
-                    client,
-                    part,
-                    workdir,
-                    archive_name=f"{base_name}_Part{index}",
-                    file_prefix=f"{base_name}_Part{index}",
-                )
-            ]
-            for index, part in enumerate(parts, start=1)
-        ]
-    else:
-        log.info("Zip not allowed for this artist: uploading gallery parts as media groups")
-        batches = [
-            _part_files(client, part, workdir, f"{base_name}_Part{index}")
-            for index, part in enumerate(parts, start=1)
-        ]
-    links = [upload.link for upload in _upload_batch(batches)]
-    log.info("Gallery ready: %s part(s) as %s", len(links), "zip" if use_zip else "media groups")
+    parts = split_balanced(list(pages), GALLERY_PART_SIZE)
+    batches = [
+        _part_files(client, part, workdir, f"{_clean_name(base_name)}_Part{index}")
+        for index, part in enumerate(parts, start=1)
+    ]
+    links = [
+        u.link
+        for u in _upload_batch(batches, force_document=bool(get_rule(rules or {}, "document", default=False)))
+    ]
+    log.info("Storage ready: %s part(s)", len(links))
     return links
+
+
+def send_hd_to_storage(client: httpx.Client, page: dict, workdir: Path, base_name: str) -> str:
+    """One original-quality image as a document -> bot deep link."""
+    name, blob = download_original(client, page)
+    path = workdir / f"{_clean_name(base_name)}_HD{Path(name).suffix.lower() or '.jpg'}"
+    path.write_bytes(blob)
+    return _upload_batch([[path]], force_document=True)[0].link

@@ -13,7 +13,7 @@ import httpx
 
 from waifu_lab.blocklist import blocked_reason
 from waifu_lab.config import CONFIG_DIR
-from waifu_lab.delivery import decide_delivery
+from waifu_lab.delivery import BOT_MIN, CHANNEL_MAX, channel_split
 from waifu_lab.enrich import load_dictionary_rows
 from waifu_lab.images import download_image, edit_image, fit_telegram
 from waifu_lab.pipeline import (
@@ -24,16 +24,16 @@ from waifu_lab.pipeline import (
     _save_state,
     prepare_post,
 )
-from waifu_lab.pixiv import adapt_list_item, fetch_user_illusts, refresh_access_token
-from waifu_lab.rules import get_rule, resolve_rules, select_page
+from waifu_lab.pixiv import adapt_list_item, fetch_illust_detail, fetch_user_illusts, refresh_access_token
+from waifu_lab.rules import deep_merge, get_rule, resolve_rules, select_page, zip_enabled
 from waifu_lab.state import load_posted, load_runtime
 from waifu_lab.tags import load_adult_set, load_content_map, load_drop_set
 from waifu_lab.telegram import split_balanced
-from waifu_lab.userbot_schedule import list_scheduled, schedule_album
+from waifu_lab.userbot_schedule import list_scheduled, schedule_album, schedule_text
 from waifu_lab.userbot_zip import (
-    gallery_part_size,
     prepare_zip,
     send_gallery_to_storage,
+    send_hd_to_storage,
     send_zip_to_storage,
     storage_configured,
     userbot_configured,
@@ -43,29 +43,13 @@ log = logging.getLogger("waifu_lab.plan")
 
 MAX_TRIES = 6
 RECENT_KEEP = 40
+NSFW_MAX_WAIT_DAYS = 3
 
 DEFAULT_SCHEDULE = {
-    "timezone": "Asia/Tehran",
-    "lead_minutes": 10,
-    "window_hours": 24,
-    "max_scheduled": 95,
-    "pool_pages": 2,
-    "slot_tolerance_minutes": 5,
-    "fallback_types": {"zip": ["album"], "telegraph": ["album"], "album": []},
-    "slots": [
-      {"time": "00:00", "type": "album"},
-      {"time": "02:00", "type": "album"},
-      {"time": "04:00", "type": "album"},
-      {"time": "06:00", "type": "telegraph"},
-      {"time": "08:00", "type": "album"},
-      {"time": "10:00", "type": "zip"},
-      {"time": "12:00", "type": "album"},
-      {"time": "14:00", "type": "album"},
-      {"time": "16:00", "type": "album"},
-      {"time": "18:00", "type": "telegraph"},
-      {"time": "20:00", "type": "album"},
-      {"time": "22:00", "type": "zip"}
-    ],
+    "timezone": "Asia/Tehran", "lead_minutes": 10, "window_hours": 24, "max_scheduled": 95,
+    "pool_pages": 2, "slot_tolerance_minutes": 5,
+    "fallback_types": {"zip": ["post"], "post": []},
+    "slots": [{"time": f"{h:02d}:00", "type": "post"} for h in range(0, 24, 2)],
 }
 
 
@@ -109,18 +93,6 @@ def _score(item: dict) -> int:
     return int(item.get("total_view") or item.get("score") or 0)
 
 
-def _cost_estimate(item: dict, method: str) -> int:
-    """How many messages of the channel's 100-slot scheduled queue the post will use.
-
-    zip = 1: only the cover photo is scheduled, the zip goes to the storage channel right away.
-    """
-    if method == "album":
-        return max(1, int(item.get("_pages") or 1))
-    return 1
-
-
-# ---- merging single-page posts into one album (rules.pages.merge_singles) ----
-
 def _age(it: dict, now: datetime) -> timedelta:
     try:
         d = datetime.fromisoformat(str(it.get("create_date")))
@@ -128,49 +100,92 @@ def _age(it: dict, now: datetime) -> timedelta:
             d = d.replace(tzinfo=timezone.utc)
         return now - d
     except Exception:
-        return timedelta(days=999)  # unknown date -> don't hold it back
+        return timedelta(days=999)
 
 
-def _virtual(chunk: list[dict]) -> dict:
-    """One pool item that stands for several single-page posts."""
+# ---------- pool items ----------
+
+def _cost(it: dict, rules: dict) -> int:
+    """Estimated scheduled messages in the channel queue."""
+    if it["_method"] == "zip":
+        return 1
+    if it["_nsfw"]:
+        own = get_rule(rules, "nsfw_cover", default="own") == "own" and not it.get("_merge")
+        return 1 if own else 6
+    return channel_split(it["_pages"])[0]
+
+
+def _annotate(it: dict, rules: dict) -> dict:
+    n = int(it.get("page_count") or 1)
+    if get_rule(rules, "pages", "drop_last", default=False) and n > 1:
+        n -= 1
+    it["_nsfw"] = bool(it.get("is_nsfw"))
+    it["_pages"] = n
+    it["_method"] = "zip" if zip_enabled(rules) else "post"
+    it["_cost"] = _cost(it, rules)
+    return it
+
+
+def _virtual(chunk: list[dict], rules: dict) -> dict:
     v = dict(chunk[0])
     v["_merge"] = list(chunk)
     v["_merge_ids"] = [c["id"] for c in chunk]
-    v["_pages"] = v["page_count"] = len(chunk)
+    v["_pages"] = sum(c["_pages"] for c in chunk)
+    v["page_count"] = v["_pages"]
     v["total_view"] = sum(_score(c) for c in chunk)
+    v["_cost"] = _cost(v, rules)
     return v
 
 
-def merge_singles(items: list[dict], conf: dict) -> list[dict]:
-    """Single-page album posts -> albums of min..max pages. NSFW/SFW never mixed.
-
-    Leftovers (fewer than min) wait for more singles; after max_wait_days they go out alone.
-    """
+def merge_singles(items: list[dict], conf: dict, rules: dict) -> list[dict]:
+    """SFW single-page posts -> albums of min..max pages."""
     mn = int(conf.get("min", 4))
-    mx = min(int(conf.get("max", 10)), 10)
+    mx = min(int(conf.get("max", 10)), CHANNEL_MAX)
     wait = timedelta(days=float(conf.get("max_wait_days", 3)))
     now = datetime.now(timezone.utc)
-    keep: list[dict] = []
-    groups: dict[bool, list[dict]] = {True: [], False: []}
-    for it in items:
-        if it["_method"] == "album" and it["_pages"] == 1:
-            groups[bool(it.get("is_nsfw"))].append(it)
-        else:
-            keep.append(it)
-    for singles in groups.values():
-        singles.sort(key=_score, reverse=True)
-        if len(singles) >= mn:
-            keep += [_virtual(c) for c in split_balanced(singles, mx)]
-        else:
-            keep += [it for it in singles if _age(it, now) >= wait]
+    singles = [it for it in items if it["_method"] == "post" and not it["_nsfw"] and it["_pages"] == 1]
+    keep = [it for it in items if it not in singles]
+    singles.sort(key=_score, reverse=True)
+    if len(singles) >= mn:
+        keep += [_virtual(c, rules) for c in split_balanced(singles, mx)]
+    else:
+        keep += [it for it in singles if _age(it, now) >= wait]
     return keep
 
 
-def build_pools(client: httpx.Client, token: str, artists: list[dict], posted_ids: set[str], pages: int) -> dict[str, dict]:
-    """Fresh candidates of every artist, each tagged with the delivery method its artist rules give it.
+def merge_small_nsfw(pools: dict[str, dict]) -> None:
+    """NSFW posts under BOT_MIN pages are combined (same artist + artists in rules.merge_with)
+    until the bundle has >= BOT_MIN pages. Leftovers wait NSFW_MAX_WAIT_DAYS, then go alone."""
+    now = datetime.now(timezone.utc)
+    taken: set[str] = set()
+    for uid, pool in pools.items():
+        partners = [uid] + [str(x) for x in get_rule(pool["rules"], "merge_with", default=[]) if str(x) in pools]
+        small = [
+            it for p in dict.fromkeys(partners) for it in pools[p]["items"]
+            if it["_nsfw"] and it["_method"] == "post" and it["_pages"] < BOT_MIN
+            and not it.get("_merge") and it["id"] not in taken
+        ]
+        small.sort(key=_score, reverse=True)
+        groups, cur, total = [], [], 0
+        for it in small:
+            cur.append(it)
+            total += it["_pages"]
+            if total >= BOT_MIN:
+                groups.append(cur)
+                cur, total = [], 0
+        used = {it["id"] for g in groups for it in g}
+        for it in cur:
+            if _age(it, now) < timedelta(days=NSFW_MAX_WAIT_DAYS):
+                it["_hold"] = True
+        taken |= used
+        for p in dict.fromkeys(partners):
+            pools[p]["items"] = [it for it in pools[p]["items"] if it["id"] not in used]
+        pool["items"] += [_virtual(g, pool["rules"]) for g in groups]
+        if groups or cur:
+            log.info("NSFW merge %s: %s bundle(s), %s waiting", pool["artist"].get("name") or uid, len(groups), len(cur))
 
-    Posts matching data/blocked_content.csv never enter a pool (checked before merging).
-    """
+
+def build_pools(client, token, artists, posted_ids: set[str], pages: int) -> dict[str, dict]:
     pools: dict[str, dict] = {}
     for artist in artists:
         uid = str(artist["user_id"])
@@ -180,9 +195,7 @@ def build_pools(client: httpx.Client, token: str, artists: list[dict], posted_id
         except Exception as exc:
             log.warning("Skipping artist %s: %s", artist.get("name") or uid, exc)
             continue
-        drop_last = bool(get_rule(rules, "pages", "drop_last", default=False))
-        items: list[dict] = []
-        blocked_n = 0
+        items, blocked_n = [], 0
         for raw in illusts:
             if not raw:
                 continue
@@ -192,45 +205,28 @@ def build_pools(client: httpx.Client, token: str, artists: list[dict], posted_id
             hit = blocked_reason(it)
             if hit:
                 blocked_n += 1
-                log.info("Blocked content %s (%s) from %s", it["id"], hit, artist.get("name") or uid)
                 continue
-            nsfw = bool(it.get("is_nsfw"))
-            n = int(it.get("page_count") or 1)
-            if drop_last and n > 1:
-                n -= 1
-            method, _ = decide_delivery(it, n, nsfw, rules)
-            it["_method"], it["_pages"] = method, n
-            items.append(it)
-
+            items.append(_annotate(it, rules))
         ms = get_rule(rules, "pages", "merge_singles", default=None)
         if ms:
-            before = len(items)
-            items = merge_singles(items, ms)
-            log.info("Merge singles %s: %s -> %s item(s)", artist.get("name") or uid, before, len(items))
-
+            items = merge_singles(items, ms, rules)
         pools[uid] = {"artist": artist, "rules": rules, "items": items}
-        kinds: dict[str, int] = {}
-        for it in items:
-            kinds[it["_method"]] = kinds.get(it["_method"], 0) + 1
-        log.info("Pool %s: %s fresh %s (blocked %s)", artist.get("name") or uid, len(items), kinds, blocked_n)
+        log.info("Pool %s: %s fresh (blocked %s)", artist.get("name") or uid, len(items), blocked_n)
         time.sleep(0.3)
+    merge_small_nsfw(pools)
     return pools
 
 
-def _next_candidate(
-    pools, slot_type: str, blocked: set[str], used_counts: dict, recent: list[str], slot_hhmm: str = ""
-):
-    """Best candidate for a slot type.
-
-    Artists with schedule.preferred_slots compete only in those slots and win them first.
-    Everyone else: least used today, then least recently used, then most viewed.
-    """
+def _next_candidate(pools, slot_type: str, blocked: set[str], used_counts: dict, recent: list[str], slot_hhmm: str = ""):
     rows = []
     for uid, pool in pools.items():
         preferred = get_rule(pool["rules"], "schedule", "preferred_slots", default=None) or []
         if preferred and slot_hhmm not in preferred:
             continue
-        cands = [c for c in pool["items"] if c["_method"] == slot_type and c["id"] not in blocked]
+        cands = [
+            c for c in pool["items"]
+            if c["_method"] == slot_type and c["id"] not in blocked and not c.get("_hold")
+        ]
         if not cands:
             continue
         top = max(cands, key=_score)
@@ -239,79 +235,92 @@ def _next_candidate(
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])
-    _, uid, top = rows[0]
-    return uid, top
+    return rows[0][1], rows[0][2]
 
 
-def _schedule_one(method: str, prep, when: datetime, client: httpx.Client, cfg: dict) -> tuple[str, int]:
-    """Schedule one post with one method. Returns (method used, scheduled messages used).
+# ---------- delivery ----------
 
-    The caption is built inside each branch: the gallery caption needs one storage bot link
-    per part, the zip caption needs its own link, and every format has its own CTA / footer.
-    """
-    chat_id = cfg["telegram_chat_id"]
-    rules = prep.rules
-    enriched = prep.enriched
-    cover_item = select_page(enriched, get_rule(rules, "cover", "page"))
+def _need_storage() -> None:
+    if not userbot_configured():
+        raise ConfigError("Userbot secrets missing or invalid (TG_API_ID / TG_API_HASH / TG_SESSION_STRING)")
+    if not storage_configured():
+        raise ConfigError("STORAGE_CHAT_ID missing or invalid")
 
-    if method == "album":
-        caption = prep.make_caption("album")
-        ordered = [cover_item] + [it for it in enriched if it is not cover_item]
-        blobs: list[bytes] = []
-        for it in ordered:
-            try:
-                blobs.append(fit_telegram(download_image(client, it)))
-            except Exception as exc:
-                log.warning("Skipping page %s: %s", it.get("id"), exc)
-        if not blobs:
-            raise RuntimeError("No album images could be downloaded")
-        ids = schedule_album(chat_id, blobs, caption, when)
-        return "album", len(ids) or len(blobs)
 
-    if method == "telegraph":
-        # gallery: every part goes to the storage channel first, the bot answers with a
-        # deep link, and only then the cover photo (with all links) is scheduled
-        if not userbot_configured():
-            raise ConfigError("Userbot secrets missing or invalid (TG_API_ID / TG_API_HASH / TG_SESSION_STRING)")
-        if not storage_configured():
-            raise ConfigError("STORAGE_CHAT_ID missing or invalid")
-        gallery_cover = select_page(
-            enriched, get_rule(rules, "delivery", "telegraph", "cover_page", default="first")
-        )
+def _blobs(client, items: list[dict], rules: dict | None = None) -> list[bytes]:
+    out = []
+    for it in items:
+        try:
+            out.append(fit_telegram(download_image(client, it)))
+        except Exception as exc:
+            log.warning("Skipping page %s: %s", it.get("id"), exc)
+    if not out:
+        raise RuntimeError("No images could be downloaded")
+    return out
+
+
+def _own_cover(prep) -> dict:
+    spec = get_rule(prep.rules, "cover_page", default="auto")
+    pages = prep.enriched
+    if spec == "auto":
+        return pages[min(1, len(pages) - 1)]
+    return select_page(pages, spec)
+
+
+def _cover_blob(client, item, rules) -> bytes:
+    blob = download_image(client, item)
+    if get_rule(rules, "image_edit", "enabled", default=False):
+        blob = edit_image(blob, rules)
+    return fit_telegram(blob)
+
+
+def deliver_post(prep, when, client, chat_id: str, cover_prep=None) -> int:
+    """Send one prepared post. when=None sends now. Returns the number of channel messages."""
+    rules, pages, n = prep.rules, prep.enriched, len(prep.enriched)
+
+    if prep.method == "zip":
+        _need_storage()
+        cover = select_page(pages, get_rule(rules, "cover_page", default="first"))
         with tempfile.TemporaryDirectory() as tmp:
-            links = send_gallery_to_storage(
-                client, enriched, Path(tmp), prep.zip_name, part_size=gallery_part_size(rules), rules=rules
-            )
-            caption = prep.make_caption("telegraph", links)
-            blob = download_image(client, gallery_cover)
-            if get_rule(rules, "image_edit", "enabled", default=False):
-                blob = edit_image(blob, rules)
-            blob = fit_telegram(blob)
-            ids = schedule_album(chat_id, [blob], caption, when)
-        return "telegraph", len(ids) or 1
-
-    if method == "zip":
-        if not userbot_configured():
-            raise ConfigError("Userbot secrets missing or invalid (TG_API_ID / TG_API_HASH / TG_SESSION_STRING)")
-        if not storage_configured():
-            raise ConfigError("STORAGE_CHAT_ID missing or invalid")
-        with tempfile.TemporaryDirectory() as tmp:
-            # everything that can fail without side effects on the channel first
-            zip_path = prepare_zip(client, enriched, prep.chosen["id01"], Path(tmp), rules, name_hint=prep.zip_name)
-            blob = download_image(client, cover_item)
-            if get_rule(rules, "image_edit", "enabled", default=False):
-                blob = edit_image(blob, rules)
-            blob = fit_telegram(blob)
-
-            # the zip goes to the storage channel now; the bot answers with a deep link
+            zip_path = prepare_zip(client, pages, prep.chosen["id01"], Path(tmp), rules, name_hint=prep.zip_name)
+            blob = _cover_blob(client, cover, rules)
             link = send_zip_to_storage(zip_path).link if zip_path else None
-            caption = prep.make_caption("zip", link)
+            ids = schedule_album(chat_id, [blob], prep.make_caption("zip", link), when)
+        return len(ids) or 1
 
-            # only the cover photo (with the link in its caption) is scheduled
-            ids = schedule_album(chat_id, [blob], caption, when)
-        return ("zip" if zip_path else "photo"), len(ids) or 1
+    if not prep.nsfw:
+        cover = select_page(pages, get_rule(rules, "cover_page", default="first"))
+        ordered = [cover] + [it for it in pages if it is not cover]
+        ch, bot = channel_split(n)
+        if n == 1 and get_rule(rules, "hd_link", default=True):
+            _need_storage()
+            with tempfile.TemporaryDirectory() as tmp:
+                link = send_hd_to_storage(client, pages[0], Path(tmp), prep.zip_name)
+            blob = _cover_blob(client, pages[0], rules)
+            return len(schedule_album(chat_id, [blob], prep.make_caption("hd", link), when)) or 1
+        if not bot:
+            blobs = _blobs(client, ordered)
+            return len(schedule_album(chat_id, blobs, prep.make_caption("album"), when)) or len(blobs)
+        _need_storage()
+        with tempfile.TemporaryDirectory() as tmp:
+            links = send_gallery_to_storage(client, ordered[ch:], Path(tmp), prep.zip_name, rules=rules)
+            blobs = _blobs(client, ordered[:ch])
+            ids = schedule_album(chat_id, blobs, prep.make_caption("bot", links), when)
+        return len(ids) or len(blobs)
 
-    raise RuntimeError(f"Unknown delivery method {method!r}")
+    # NSFW: everything goes to the bot, the channel gets a cover / an SFW album / a text teaser
+    _need_storage()
+    with tempfile.TemporaryDirectory() as tmp:
+        links = send_gallery_to_storage(client, pages, Path(tmp), prep.zip_name, rules=rules)
+    caption = prep.make_caption("bot", links)
+    if cover_prep is not None:
+        blobs = _blobs(client, cover_prep.enriched[:CHANNEL_MAX])
+        return len(schedule_album(chat_id, blobs, caption, when)) or len(blobs)
+    if get_rule(rules, "nsfw_cover", default="own") == "own" and not prep.chosen.get("_merge"):
+        blob = _cover_blob(client, _own_cover(prep), rules)
+        return len(schedule_album(chat_id, [blob], caption, when)) or 1
+    log.warning("No SFW cover for %s: sending a text post", prep.item_id)
+    return len(schedule_text(chat_id, caption, when)) or 1
 
 
 class Planner:
@@ -336,28 +345,72 @@ class Planner:
         self.runtime["planRecent"] = self.recent[-RECENT_KEEP:]
         _save_state(self.cfg, self.posted, self.runtime)
 
-    def _schedule(self, prep, slot: Slot) -> tuple[str, int]:
-        errors: list[Exception] = []
-        for m in prep.chain:
-            try:
-                return _schedule_one(m, prep, slot.when, self.client, self.cfg)
-            except Exception as exc:
-                errors.append(exc)
-                log.warning("Scheduling %s failed for %s: %s", m, prep.item_id, exc)
-                if "SCHEDULE_TOO_MUCH" in str(exc):
-                    break
-        real = [e for e in errors if not isinstance(e, ConfigError)]
-        raise (real[0] if real else errors[0])
-
-    def _record(self, slot: Slot, uid: str, cand: dict, prep, method: str, cost: int) -> None:
-        self.used_counts[uid] = self.used_counts.get(uid, 0) + 1
-        self.recent.append(uid)
-        self.taken.update(cand.get("_merge_ids") or [cand["id"]])
-        name = self.pools[uid]["artist"].get("name") or uid
-        merged = f" (merged {len(cand['_merge_ids'])})" if cand.get("_merge_ids") else ""
-        self.rows.append(
-            f"{slot.when:%H:%M}  {method:9} {name} | {cand['id']}{merged} | {len(prep.valid)} pages | {cost} msg"
+    def _prep(self, cand, nsfw, rules):
+        return prepare_post(
+            self.client, self.token, cand, self.dict_rows, self.content_map, self.adult_set,
+            self.drop_set, self.posted, self.runtime, rules, nsfw, self.dry,
         )
+
+    def _find_cover(self, uid: str):
+        """SFW cover album for an NSFW post: same artist first, then rules.sfw_fallback artists."""
+        order = [uid] + [str(x) for x in get_rule(self.pools[uid]["rules"], "sfw_fallback", default=[])]
+        blocked = self.rejected | self.taken | set(self.posted)
+        for u in dict.fromkeys(order):
+            pool = self.pools.get(u)
+            if not pool:
+                continue
+            cands = [
+                c for c in pool["items"]
+                if not c["_nsfw"] and c["_method"] == "post" and not c.get("_merge")
+                and not c.get("_hold") and c["id"] not in blocked
+            ]
+            for c in sorted(cands, key=_score, reverse=True)[:3]:
+                try:
+                    p = self._prep(c, False, pool["rules"])
+                except Exception as exc:
+                    log.warning("SFW cover %s failed: %s", c["id"], exc)
+                    self.rejected.add(c["id"])
+                    continue
+                if p is None:
+                    self.rejected.add(c["id"])
+                    continue
+                return c, p
+        return None, None
+
+    def deliver(self, uid: str, cand: dict, when, label: str) -> bool | None:
+        """True = delivered/dry-ok, None = skipped (nothing to send). Raises on failure."""
+        pool = self.pools[uid]
+        rules, nsfw = pool["rules"], cand["_nsfw"]
+        prep = self._prep(cand, nsfw, rules)
+        if prep is None:
+            return None
+        cover_c = cover_p = None
+        if nsfw and prep.method != "zip" and (
+            cand.get("_merge") or get_rule(rules, "nsfw_cover", default="own") == "sfw"
+        ):
+            cover_c, cover_p = self._find_cover(uid)
+        ids = cand.get("_merge_ids") or [cand["id"]]
+        name = pool["artist"].get("name") or uid
+
+        if self.dry:
+            cap = prep.make_caption().splitlines()
+            log.info("DRY %s -> %s | %s %s | %s pages | cover=%s | %s", label, ids, "NSFW" if nsfw else "SFW",
+                     prep.method, len(prep.enriched), cover_c["id"] if cover_c else "own/text", " / ".join(cap[:2]))
+            self.rows.append(f"{label} {prep.method} {name} | {ids} | {len(prep.enriched)} pages")
+            return True
+
+        cost = deliver_post(prep, when, self.client, self.cfg["telegram_chat_id"], cover_p)
+        stamp = f"scheduled:{prep.method}:{when:%Y-%m-%dT%H:%M}" if when else f"sent:{prep.method}"
+        for mid in ids:
+            _mark_done(self.posted, self.runtime, mid, stamp)
+        if cover_c:
+            for mid in cover_c.get("_merge_ids") or [cover_c["id"]]:
+                _mark_done(self.posted, self.runtime, mid, f"cover_of:{ids[0]}")
+            self.taken.add(cover_c["id"])
+        _persist_stats(self.cfg, prep.classified, nsfw=nsfw)
+        self.budget_used += cost
+        self.rows.append(f"{label} {prep.method} {name} | {ids} | {len(prep.enriched)} pages | {cost} msg")
+        return True
 
     def fill(self, slot: Slot) -> bool:
         for slot_type in [slot.type, *self.conf["fallback_types"].get(slot.type, [])]:
@@ -368,72 +421,67 @@ class Planner:
         return False
 
     def _try(self, slot: Slot, slot_type: str) -> bool:
-        slot_hhmm = f"{slot.when:%H:%M}"
+        hhmm = f"{slot.when:%H:%M}"
         for _ in range(MAX_TRIES):
             blocked = self.rejected | self.taken | set(self.posted)
-            pick = _next_candidate(self.pools, slot_type, blocked, self.used_counts, self.recent, slot_hhmm)
+            pick = _next_candidate(self.pools, slot_type, blocked, self.used_counts, self.recent, hhmm)
             if pick is None:
                 return False
             uid, cand = pick
-            pool = self.pools[uid]
-            est = _cost_estimate(cand, slot_type)
-            if self.budget_used + est > self.max_scheduled:
-                log.info("Skipping %s: %s msg would pass the scheduled limit", cand["id"], est)
+            if self.budget_used + cand["_cost"] > self.max_scheduled:
+                log.info("Skipping %s: would pass the scheduled limit", cand["id"])
                 self.rejected.add(cand["id"])
                 continue
-            nsfw = bool(cand.get("is_nsfw"))
+            ids = cand.get("_merge_ids") or [cand["id"]]
             try:
-                prep = prepare_post(
-                    self.client, self.token, cand, self.dict_rows, self.content_map, self.adult_set,
-                    self.drop_set, self.posted, self.runtime, pool["rules"], nsfw, self.dry,
-                )
-            except Exception as exc:
-                log.warning("Could not prepare %s: %s", cand["id"], exc)
-                self.rejected.add(cand["id"])
-                continue
-            if prep is None:
-                self.rejected.add(cand["id"])
-                self._save()  # persists the "skipped" mark (blocked content / no valid images)
-                continue
-            if prep.method != slot_type:
-                log.info("Candidate %s resolved to %s but the slot needs %s", cand["id"], prep.method, slot_type)
-                self.rejected.add(cand["id"])
-                continue
-
-            if self.dry:
-                cap = prep.make_caption(prep.method).splitlines()
-                log.info(
-                    "DRY_RUN plan %s -> %s | %s | zip_name=%s | %s",
-                    slot.label(), cand["id"], prep.method, prep.zip_name, " / ".join(cap[:2]),
-                )
-                self._record(slot, uid, cand, prep, prep.method, est)
-                return True
-
-            try:
-                used_method, cost = self._schedule(prep, slot)
+                res = self.deliver(uid, cand, slot.when, slot.label())
             except ConfigError:
                 raise
             except Exception as exc:
                 self.errors.append(exc)
+                log.warning("Delivery failed for %s: %s", cand["id"], exc)
                 if "SCHEDULE_TOO_MUCH" in str(exc):
-                    log.error("Telegram scheduled-message limit reached; stopping the plan")
                     self.full = True
                     return False
-                for mid in cand.get("_merge_ids") or [cand["id"]]:
+                for mid in ids:
                     _record_failure(self.posted, self.runtime, mid)
                 self.rejected.add(cand["id"])
                 self._save()
                 continue
-
-            for mid in cand.get("_merge_ids") or [cand["id"]]:
-                _mark_done(self.posted, self.runtime, mid, f"scheduled:{used_method}:{slot.when:%Y-%m-%dT%H:%M}")
-            _persist_stats(self.cfg, prep.classified, nsfw=nsfw)
-            self.budget_used += cost
-            self._record(slot, uid, cand, prep, used_method, cost)
+            if res is None:
+                self.rejected.add(cand["id"])
+                self._save()
+                continue
+            self.taken.add(cand["id"])
+            self.used_counts[uid] = self.used_counts.get(uid, 0) + 1
+            self.recent.append(uid)
             self._save()
-            time.sleep(2)  # about one message per second per chat
+            if not self.dry:
+                time.sleep(2)
             return True
         return False
+
+
+def _state(cfg):
+    st = cfg.get("state")
+    if st:
+        return st.runtime(), st.posted()
+    runtime = (
+        load_runtime(cfg["runtime_path"])
+        if "runtime_path" in cfg
+        else {"recentlyUsed": [], "recentCaptions": {}, "failures": {}}
+    )
+    posted = load_posted(cfg["posted_path"]) if "posted_path" in cfg else {}
+    return runtime, posted
+
+
+def _data(cfg):
+    return (
+        load_dictionary_rows(cfg["dictionary_path"]),
+        load_content_map(cfg["content_tags_path"]),
+        load_adult_set(cfg["adult_tags_path"]),
+        load_drop_set(cfg["drop_tags_path"]),
+    )
 
 
 def run_plan(cfg: dict, dry: bool) -> int:
@@ -441,14 +489,13 @@ def run_plan(cfg: dict, dry: bool) -> int:
     tz = ZoneInfo(conf["timezone"])
     now = datetime.now(tz)
     slots = upcoming_slots(conf, now)
-    log.info("Plan at %s (%s): %s slot(s) in the next %sh", now.strftime("%Y-%m-%d %H:%M"), conf["timezone"], len(slots), conf["window_hours"])
+    log.info("Plan at %s: %s slot(s)", now.strftime("%Y-%m-%d %H:%M"), len(slots))
     if not slots:
         return 0
-
     chat_id = cfg["telegram_chat_id"]
     have_userbot = userbot_configured()
     if not dry and not have_userbot:
-        raise ConfigError("Userbot secrets missing or invalid (TG_API_ID / TG_API_HASH / TG_SESSION_STRING)")
+        raise ConfigError("Userbot secrets missing or invalid")
 
     existing: list[dict] = []
     if have_userbot:
@@ -461,36 +508,88 @@ def run_plan(cfg: dict, dry: bool) -> int:
 
     tol = timedelta(minutes=int(conf["slot_tolerance_minutes"]))
     open_slots = [s for s in slots if not _occupied(s, existing, tol)]
-    log.info("Scheduled queue has %s message(s); open slots: %s", len(existing), [s.label() for s in open_slots])
+    log.info("Queue %s message(s); open slots: %s", len(existing), [s.label() for s in open_slots])
     if not open_slots:
-        log.info("Nothing to plan")
         return 0
 
-    runtime = cfg["state"].runtime() if "state" in cfg and cfg["state"] else load_runtime(cfg["runtime_path"])
-    posted = cfg["state"].posted() if "state" in cfg and cfg["state"] else load_posted(cfg["posted_path"])
-    dict_rows = load_dictionary_rows(cfg["dictionary_path"])
-    content_map = load_content_map(cfg["content_tags_path"])
-    adult_set = load_adult_set(cfg["adult_tags_path"])
-    drop_set = load_drop_set(cfg["drop_tags_path"])
+    runtime, posted = _state(cfg)
+    dict_rows, content_map, adult_set, drop_set = _data(cfg)
 
     with httpx.Client(follow_redirects=True, timeout=20.0) as client:
         token = refresh_access_token(client, cfg["pixiv_refresh_token"])
         pools = build_pools(client, token, cfg["artists"], set(posted), int(conf["pool_pages"]))
-        planner = Planner(
-            cfg, conf, client, token, pools, posted, runtime, dict_rows, content_map, adult_set, drop_set, dry, len(existing)
-        )
-        empty: list[str] = []
+        planner = Planner(cfg, conf, client, token, pools, posted, runtime, dict_rows, content_map, adult_set, drop_set, dry, len(existing))
+        empty = []
         for slot in open_slots:
-            if planner.full:
+            if planner.full or not planner.fill(slot):
                 empty.append(slot.label())
-                continue
-            if not planner.fill(slot):
-                empty.append(slot.label())
-                log.warning("Slot %s could not be filled", slot.label())
-
-    log.info("Plan summary (%s):\n%s", "dry run" if dry else "scheduled", "\n".join(planner.rows) or "(nothing)")
+    log.info("Plan summary:\n%s", "\n".join(planner.rows) or "(nothing)")
     if empty:
         log.warning("Empty slots: %s", empty)
     if planner.errors and not planner.rows:
         raise planner.errors[0]
+    return 0
+
+
+# ---------- manual post by illust id ----------
+
+def _overrides(ov: dict) -> dict:
+    """One-time choices from the bot wizard -> rules patch."""
+    out: dict = {}
+    if ov.get("nsfw_cover") in ("own", "sfw"):
+        out["nsfw_cover"] = ov["nsfw_cover"]
+    if "zip" in ov:
+        out["zip"] = {"pages": "all"} if ov["zip"] else None
+    if "document" in ov:
+        out["document"] = bool(ov["document"])
+    if "hd_link" in ov:
+        out["hd_link"] = bool(ov["hd_link"])
+    return out
+
+
+def run_manual(cfg: dict, batch: dict) -> int:
+    dry = cfg["dry_run"]
+    iid = str(batch.get("illust_id") or "").strip()
+    if not iid.isdigit():
+        raise RuntimeError("manual batch needs a numeric illust_id")
+    when = None
+    if batch.get("when"):
+        when = datetime.fromisoformat(str(batch["when"]).replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+    conf = load_schedule()
+    runtime, posted = _state(cfg)
+    dict_rows, content_map, adult_set, drop_set = _data(cfg)
+
+    with httpx.Client(follow_redirects=True, timeout=20.0) as client:
+        token = refresh_access_token(client, cfg["pixiv_refresh_token"])
+        detail = fetch_illust_detail(client, token, iid)
+        uid = str((detail.get("user") or {}).get("id") or "")
+        base = next((a for a in cfg["artists"] if str(a["user_id"]) == uid),
+                    {"user_id": uid, "name": (detail.get("user") or {}).get("name", ""), "rules": {}})
+        artist = {**base, "rules": deep_merge(base.get("rules") or {}, _overrides(batch.get("overrides") or {}))}
+        rules = resolve_rules(artist)
+
+        item = _annotate(adapt_list_item(detail), rules)
+        pools = {uid: {"artist": artist, "rules": rules, "items": []}}
+        if item["_nsfw"] and item["_method"] == "post" and get_rule(rules, "nsfw_cover", default="own") == "sfw":
+            wanted = [uid] + [str(x) for x in get_rule(rules, "sfw_fallback", default=[])]
+            arts = [artist] + [a for a in cfg["artists"] if str(a["user_id"]) in wanted and str(a["user_id"]) != uid]
+            pools = build_pools(client, token, arts, set(posted) | {item["id"]}, int(conf["pool_pages"]))
+            pools.setdefault(uid, {"artist": artist, "rules": rules, "items": []})
+        pools[uid]["rules"] = rules
+
+        planner = Planner(cfg, conf, client, token, pools, posted, runtime, dict_rows, content_map, adult_set, drop_set, dry, 0)
+        pools[uid]["items"] = [it for it in pools[uid]["items"] if it["id"] != item["id"]] + [item]
+        try:
+            res = planner.deliver(uid, item, when, f"manual {iid}")
+        except Exception:
+            if not dry:
+                _record_failure(posted, runtime, item["id"])
+                planner._save()
+            raise
+        if res is None:
+            log.warning("Manual post %s was skipped (blocked content or no valid images)", iid)
+        planner._save()
+    log.info("Manual summary: %s", planner.rows or "(nothing)")
     return 0

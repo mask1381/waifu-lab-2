@@ -5,23 +5,19 @@
   "max_scheduled": 95,
   "pool_pages": 2,
   "slot_tolerance_minutes": 5,
-  "fallback_types": {
-    "zip": ["album"],
-    "telegraph": ["album"],
-    "album": []
-  },
+  "fallback_types": {"zip": ["post"], "post": []},
   "slots": [
-    {"time": "00:00", "type": "album"},
-    {"time": "02:00", "type": "album"},
-    {"time": "04:00", "type": "album"},
-    {"time": "06:00", "type": "telegraph"},
-    {"time": "08:00", "type": "album"},
+    {"time": "00:00", "type": "post"},
+    {"time": "02:00", "type": "post"},
+    {"time": "04:00", "type": "post"},
+    {"time": "06:00", "type": "post"},
+    {"time": "08:00", "type": "post"},
     {"time": "10:00", "type": "zip"},
-    {"time": "12:00", "type": "album"},
-    {"time": "14:00", "type": "album"},
-    {"time": "16:00", "type": "album"},
-    {"time": "18:00", "type": "telegraph"},
-    {"time": "20:00", "type": "album"},
+    {"time": "12:00", "type": "post"},
+    {"time": "14:00", "type": "post"},
+    {"time": "16:00", "type": "post"},
+    {"time": "18:00", "type": "post"},
+    {"time": "20:00", "type": "post"},
     {"time": "22:00", "type": "zip"}
   ]
 }

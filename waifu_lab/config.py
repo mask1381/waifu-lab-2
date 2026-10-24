@@ -50,4 +50,6 @@ def env_config(batch: dict) -> dict:
         "content_tags_path": DATA_DIR / "content_tags.csv",
         "adult_tags_path": DATA_DIR / "adult_tags.csv",
         "drop_tags_path": DATA_DIR / "drop_tags.csv",
+        "runtime_path": DATA_DIR / "runtime.json",
+        "posted_path": DATA_DIR / "posted.json",
     }
