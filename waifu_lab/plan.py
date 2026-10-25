@@ -259,6 +259,11 @@ def _blobs(client, items: list[dict], rules: dict | None = None) -> list[bytes]:
     return out
 
 
+def _cover_spec(rules: dict):
+    spec = get_rule(rules, "cover_page", default="auto")
+    return "first" if spec == "auto" else spec
+
+
 def _own_cover(prep) -> dict:
     spec = get_rule(prep.rules, "cover_page", default="auto")
     pages = prep.enriched
@@ -280,7 +285,7 @@ def deliver_post(prep, when, client, chat_id: str, cover_prep=None) -> int:
 
     if prep.method == "zip":
         _need_storage()
-        cover = select_page(pages, get_rule(rules, "cover_page", default="first"))
+        cover = select_page(pages, _cover_spec(rules))
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = prepare_zip(client, pages, prep.chosen["id01"], Path(tmp), rules, name_hint=prep.zip_name)
             blob = _cover_blob(client, cover, rules)
@@ -289,7 +294,7 @@ def deliver_post(prep, when, client, chat_id: str, cover_prep=None) -> int:
         return len(ids) or 1
 
     if not prep.nsfw:
-        cover = select_page(pages, get_rule(rules, "cover_page", default="first"))
+        cover = select_page(pages, _cover_spec(rules))
         ordered = [cover] + [it for it in pages if it is not cover]
         ch, bot = channel_split(n)
         if n == 1 and get_rule(rules, "hd_link", default=True):
