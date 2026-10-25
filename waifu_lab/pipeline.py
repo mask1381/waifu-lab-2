@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from waifu_lab.blocklist import blocked_reason
-from waifu_lab.caption import build_caption, caption_parts
-from waifu_lab.delivery import caption_format, decide
+from waifu_lab.caption import build_caption, build_cover_caption, caption_parts
+from waifu_lab.delivery import caption_format, channel_split, decide
 from waifu_lab.enrich import enrich_posts
 from waifu_lab.images import has_valid_urls
 from waifu_lab.pixiv import adapt_detail_pages, fetch_illust_detail
@@ -134,6 +134,7 @@ class PreparedPost:
     method: str          # zip | post
     parts: dict
     dry: bool = False
+    runtime: dict = field(default_factory=dict)
 
     @property
     def item_id(self) -> str:
@@ -148,15 +149,23 @@ class PreparedPost:
     def fmt(self) -> str:
         return caption_format(self.method, self.nsfw, len(self.enriched), self.rules)
 
-    def make_caption(self, m: str | None = None, page_url: str | list[str] | None = None) -> str:
+    def make_caption(self, m: str | None = None, page_url=None, cover=None) -> str:
+        """m: zip | album | bot | hd | cover. 'cover' needs the prepared SFW cover post."""
         m = m or self.fmt
+        if m == "cover" and cover is None:
+            m = "bot"
         if page_url is None and self.dry:
-            if m == "bot":
+            if m in ("bot", "cover"):
                 page_url = [f"{DRY_BOT_LINK}1"]
             elif m in ("zip", "hd"):
                 page_url = DRY_BOT_LINK
+        if m == "cover":
+            return build_cover_caption(cover.parts, cover.classified, self.classified, page_url, self.rules, self.runtime)
+        n = len(self.enriched)
+        count = (n if self.nsfw else channel_split(n)[1]) if m == "bot" else n
         return build_caption(
-            self.parts, m, len(self.enriched), self.classified["hashtags"], self.rules, self.classified, page_url
+            self.parts, m, count, self.classified["hashtags"], self.rules, self.classified, page_url,
+            more=(m == "bot" and not self.nsfw),
         )
 
 
@@ -202,7 +211,7 @@ def prepare_post(
     method = decide(len(valid), nsfw, rules)
     parts = caption_parts(enriched, nsfw, runtime, classified)
     log.info("Prepared %s %s: %s pages, method=%s", kind, item_id, len(valid), method)
-    return PreparedPost(chosen, nsfw, rules, valid, enriched, classified, method, parts, dry)
+    return PreparedPost(chosen, nsfw, rules, valid, enriched, classified, method, parts, dry, runtime)
 
 
 def _persist_stats(cfg, classified, nsfw: bool) -> None:

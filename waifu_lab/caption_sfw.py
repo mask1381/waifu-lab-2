@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import re
 
+from waifu_lab.names import franchise_short, person_name
 from waifu_lab.title import emoji_tail
 
 MIN_CLUSTER_SCORE = 3
@@ -190,9 +191,11 @@ def sfw_parts(items: list[dict], runtime: dict, info: dict | None = None) -> tup
             franchise = cand
             break
 
+    characters = list(dict.fromkeys(n for n in (person_name(c) for c in characters) if n))
+    franchise = franchise_short(franchise)
     if info:  # names resolved by classify_tags (dictionary + 'Name (Work)' tags)
-        characters = [c for c in info.get("characters") or [] if _ok_name(c)]
-        franchise = info["franchise"] if _ok_name(info.get("franchise") or "") else None
+        characters = list(dict.fromkeys(n for n in (person_name(c) for c in info.get("characters") or []) if n))
+        franchise = franchise_short(info.get("franchise"))
 
     # the artist's own Latin title (set by the pipeline) beats a random template
     art_title = next((it.get("art_title") for it in items if it.get("art_title")), None)

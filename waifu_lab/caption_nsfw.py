@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from waifu_lab.names import franchise_short, person_name
 from waifu_lab.title import emoji_tail
 
 JP_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
@@ -189,8 +190,10 @@ def _title_teaser(items: list[dict], translation_map: dict[str, str | None], inf
 
     if info:  # names resolved by classify_tags
         unique_chars = list(info.get("characters") or [])
-        if info.get("franchise") and len(info["franchise"]) <= 25:
+        if info.get("franchise"):
             franchise_en = info["franchise"]
+    unique_chars = list(dict.fromkeys(n for n in (person_name(c) for c in unique_chars) if n))
+    franchise_en = franchise_short(franchise_en)
 
     if len(unique_chars) == 1:
         teaser = TEASER_TEMPLATES_SINGLE[hash_string(base_seed + "::t1") % len(TEASER_TEMPLATES_SINGLE)](unique_chars[0])

@@ -313,14 +313,15 @@ def deliver_post(prep, when, client, chat_id: str, cover_prep=None) -> int:
             ids = schedule_album(chat_id, blobs, prep.make_caption("bot", links), when)
         return len(ids) or len(blobs)
 
-    # NSFW: everything goes to the bot, the channel gets a cover / an SFW album / a text teaser
+    # NSFW: everything goes to the bot, the channel gets a cover / an SFW album / a text post
     _need_storage()
     with tempfile.TemporaryDirectory() as tmp:
         links = send_gallery_to_storage(client, pages, Path(tmp), prep.zip_name, rules=rules)
-    caption = prep.make_caption("bot", links)
     if cover_prep is not None:
+        caption = prep.make_caption("cover", links, cover=cover_prep)
         blobs = _blobs(client, cover_prep.enriched[:CHANNEL_MAX])
         return len(schedule_album(chat_id, blobs, caption, when)) or len(blobs)
+    caption = prep.make_caption("bot", links)
     if get_rule(rules, "nsfw_cover", default="own") == "own" and not prep.chosen.get("_merge"):
         blob = _cover_blob(client, _own_cover(prep), rules)
         return len(schedule_album(chat_id, [blob], caption, when)) or 1
@@ -398,9 +399,9 @@ class Planner:
         name = pool["artist"].get("name") or uid
 
         if self.dry:
-            cap = prep.make_caption().splitlines()
+            cap = (prep.make_caption("cover", cover=cover_p) if cover_p else prep.make_caption()).splitlines()
             log.info("DRY %s -> %s | %s %s | %s pages | cover=%s | %s", label, ids, "NSFW" if nsfw else "SFW",
-                     prep.method, len(prep.enriched), cover_c["id"] if cover_c else "own/text", " / ".join(cap[:2]))
+                     prep.method, len(prep.enriched), cover_c["id"] if cover_c else "own/text", " / ".join(cap[:3]))
             self.rows.append(f"{label} {prep.method} {name} | {ids} | {len(prep.enriched)} pages")
             return True
 
