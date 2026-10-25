@@ -312,7 +312,7 @@ def _pick_bot_link(message, pattern: re.Pattern) -> str | None:
 
     wanted = _label_key(_link_label())
     for pos, link in links:
-        if wanted and wanted in _label_key(_link_label_line(text, pos)):
+        if wanted and wanted in _link_label_line(text, pos):
             log.info("Bot reply: picked the %r link %s", _link_label(), link)
             return link
 
@@ -459,11 +459,25 @@ def send_gallery_to_storage(
         _part_files(client, part, workdir, f"{_clean_name(base_name)}_Part{index}")
         for index, part in enumerate(parts, start=1)
     ]
-    links = [
-        u.link
-        for u in _upload_batch(batches, force_document=bool(get_rule(rules or {}, "document", default=False)))
-    ]
-    log.info("Storage ready: %s part(s)", len(links))
+    force_doc = bool(get_rule(rules or {}, "document", default=False))
+    if len(batches) > 1:
+        from waifu_lab.bulk_storage import bulk_upload  # lazy: bulk_storage imports this module
+
+        last: Exception | None = None
+        for attempt in range(1, STORAGE_ATTEMPTS + 1):
+            try:
+                link = bulk_upload(batches, force_document=force_doc)
+                log.info("Storage ready: %s parts, ONE bulk link", len(batches))
+                return [link]
+            except Exception as exc:
+                last = exc
+                log.warning("Bulk upload failed (try %s/%s): %s", attempt, STORAGE_ATTEMPTS, exc)
+                if attempt < STORAGE_ATTEMPTS:
+                    time.sleep(5 * attempt)
+        raise RuntimeError(f"Bulk upload failed after {STORAGE_ATTEMPTS} attempts") from last
+
+    links = [u.link for u in _upload_batch(batches, force_document=force_doc)]
+    log.info("Storage ready: 1 part")
     return links
 
 

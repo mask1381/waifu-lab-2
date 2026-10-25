@@ -44,7 +44,7 @@ async def _cmd(client, entity, cmd: str, want_link: bool) -> str:
     raise RuntimeError(f"bot did not answer {cmd}")
 
 
-async def _bulk_all(batches: list[list[Path]]) -> str:
+async def _bulk_all(batches: list[list[Path]], force_document: bool = False) -> str:
     from telethon import TelegramClient
     from telethon.sessions import StringSession
 
@@ -61,7 +61,7 @@ async def _bulk_all(batches: list[list[Path]]) -> str:
         try:
             for paths in batches:
                 payload = str(paths[0]) if len(paths) == 1 else [str(p) for p in paths]
-                as_doc = len(paths) == 1 and paths[0].suffix.lower() == ".zip"
+                as_doc = force_document or (len(paths) == 1 and paths[0].suffix.lower() == ".zip")
                 sent = await client.send_file(entity, payload, force_document=as_doc)
                 ids += [int(m.id) for m in (sent if isinstance(sent, (list, tuple)) else [sent])]
                 await asyncio.sleep(BETWEEN_ALBUMS)
@@ -84,7 +84,7 @@ async def _bulk_all(batches: list[list[Path]]) -> str:
         await client.disconnect()
 
 
-def bulk_upload(batches: list[list[Path]]) -> str:
+def bulk_upload(batches: list[list[Path]], force_document: bool = False) -> str:
     if not batches:
         raise ValueError("Nothing to upload")
-    return asyncio.run(_bulk_all(batches))
+    return asyncio.run(_bulk_all(batches, force_document))
