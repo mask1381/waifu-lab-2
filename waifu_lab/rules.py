@@ -20,6 +20,13 @@ DEFAULT_RULES: dict[str, Any] = {
         "format_tag": True,
         "passthrough": {"sfw": True, "nsfw": True, "max": 2, "max_nsfw": 1},
     },
+    "law": {   # لایحه‌ی کانال — استثنای هنرمند (rules.law) همین keys را override می‌کند
+        "split": {"full_to_channel": 10, "share_div": 3, "min_channel": 2, "max_channel": 6},
+        "zip": {"sfw_after": 0, "nsfw_after": 5},
+        "nsfw": {"channel_mode": "cover_only", "single_in_channel": 1, "cover": "sfw_or_text", "spoiler": True},
+        "single": {"sfw_hd": True, "nsfw_hd": True},
+        "merge": {"min": 4, "max": 10, "max_wait_days": 3},
+    },
 }
 ALLOWED_KEYS = set(DEFAULT_RULES) | {"caption", "image_edit"}
 
@@ -35,10 +42,19 @@ def deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
-def resolve_rules(artist: dict) -> dict:
-    """Unknown/legacy keys (delivery.*, zip.enabled ...) are dropped on purpose."""
+def resolve_rules(artist: dict, channel_law: dict | None = None) -> dict:
+    """Unknown/legacy keys (delivery.*, zip.enabled ...) are dropped on purpose.
+    channel_law (لایحه‌ی کانال از بات) به‌عنوان پایه‌ی rules.law می‌نشیند و
+    استثنای هنرمند (rules.law) روی آن اعمال می‌شود.
+
+    DEFAULT_RULES is never mutated: each call starts from a fresh copy so successive
+    artists / batches cannot leak a previous channel_law into the next one.
+    """
+    base = deep_merge(DEFAULT_RULES, {})
+    if channel_law:
+        base["law"] = deep_merge(base["law"], copy.deepcopy(channel_law))
     own = {k: v for k, v in (artist.get("rules") or {}).items() if k in ALLOWED_KEYS}
-    return deep_merge(DEFAULT_RULES, own)
+    return deep_merge(base, own)
 
 
 def zip_enabled(rules: dict | None) -> bool:

@@ -45,6 +45,7 @@ def env_config(batch: dict) -> dict:
         "telegram_bot_token": bot,
         "telegram_chat_id": chat,
         "dry_run": dry_run,
+        "channel_law": batch.get("channel_law") or {},   # لایحه‌ی کانال از بات
         "artists": list(batch.get("artists") or []),
         "dictionary_path": DATA_DIR / "character_dictionary.csv",
         "content_tags_path": DATA_DIR / "content_tags.csv",

@@ -13,7 +13,7 @@ import httpx
 
 from waifu_lab.blocklist import blocked_reason
 from waifu_lab.config import CONFIG_DIR
-from waifu_lab.delivery import BOT_MIN, CHANNEL_MAX, channel_split
+from waifu_lab.delivery import BOT_MIN, CHANNEL_MAX, channel_split, nsfw_channel_mode, decide
 from waifu_lab.enrich import load_dictionary_rows
 from waifu_lab.images import download_image, edit_image, fit_telegram
 from waifu_lab.pipeline import (
@@ -112,7 +112,7 @@ def _cost(it: dict, rules: dict) -> int:
     if it["_nsfw"]:
         own = get_rule(rules, "nsfw_cover", default="own") == "own" and not it.get("_merge")
         return 1 if own else 6
-    return channel_split(it["_pages"])[0]
+    return channel_split(it["_pages"], rules)[0]
 
 
 def _annotate(it: dict, rules: dict) -> dict:
@@ -121,7 +121,7 @@ def _annotate(it: dict, rules: dict) -> dict:
         n -= 1
     it["_nsfw"] = bool(it.get("is_nsfw"))
     it["_pages"] = n
-    it["_method"] = "zip" if zip_enabled(rules) else "post"
+    it["_method"] = decide(n, it["_nsfw"], rules)
     it["_cost"] = _cost(it, rules)
     return it
 
@@ -185,11 +185,11 @@ def merge_small_nsfw(pools: dict[str, dict]) -> None:
             log.info("NSFW merge %s: %s bundle(s), %s waiting", pool["artist"].get("name") or uid, len(groups), len(cur))
 
 
-def build_pools(client, token, artists, posted_ids: set[str], pages: int) -> dict[str, dict]:
+def build_pools(client, token, artists, posted_ids: set[str], pages: int, channel_law: dict | None = None) -> dict[str, dict]:
     pools: dict[str, dict] = {}
     for artist in artists:
         uid = str(artist["user_id"])
-        rules = resolve_rules(artist)
+        rules = resolve_rules(artist, channel_law)
         try:
             illusts = fetch_user_illusts(client, token, uid, posted_ids, max_pages=pages, early_break=False)
         except Exception as exc:
@@ -296,7 +296,7 @@ def deliver_post(prep, when, client, chat_id: str, cover_prep=None) -> int:
     if not prep.nsfw:
         cover = select_page(pages, _cover_spec(rules))
         ordered = [cover] + [it for it in pages if it is not cover]
-        ch, bot = channel_split(n)
+        ch, bot = channel_split(n, rules)
         if n == 1 and get_rule(rules, "hd_link", default=True):
             _need_storage()
             with tempfile.TemporaryDirectory() as tmp:
@@ -313,10 +313,28 @@ def deliver_post(prep, when, client, chat_id: str, cover_prep=None) -> int:
             ids = schedule_album(chat_id, blobs, prep.make_caption("bot", links), when)
         return len(ids) or len(blobs)
 
-    # NSFW: everything goes to the bot, the channel gets a cover / an SFW album / a text post
+    # NSFW: the channel law decides the channel mode:
+    #   cover_only        -> everything to bot, channel gets a cover / SFW album / text (default)
+    #   single_to_channel -> single_in_channel page(s) to channel, rest to bot (cover only, full album in bot)
+    #   all_to_channel    -> the whole NSFW album goes to the channel
+    mode = nsfw_channel_mode(rules)
+    if mode == "all_to_channel":
+        return len(_blobs(client, pages)) and len(
+            schedule_album(chat_id, _blobs(client, pages), prep.make_caption("album"), when)
+        ) or len(pages)
+
     _need_storage()
     with tempfile.TemporaryDirectory() as tmp:
         links = send_gallery_to_storage(client, pages, Path(tmp), prep.zip_name, rules=rules)
+
+    if mode == "single_to_channel":
+        single = int(get_rule(rules, "law", "nsfw", "single_in_channel", default=1) or 1)
+        single = max(1, min(single, n))
+        _need_storage()
+        with tempfile.TemporaryDirectory() as tmp:
+            sub_links = send_gallery_to_storage(client, pages[:single], Path(tmp), prep.zip_name + "-c", rules=rules)
+        return len(schedule_album(chat_id, _blobs(client, pages[:single]), prep.make_caption("bot", sub_links), when)) or single
+
     if cover_prep is not None:
         caption = prep.make_caption("cover", links, cover=cover_prep)
         blobs = _blobs(client, cover_prep.enriched[:CHANNEL_MAX])
@@ -523,7 +541,7 @@ def run_plan(cfg: dict, dry: bool) -> int:
 
     with httpx.Client(follow_redirects=True, timeout=20.0) as client:
         token = refresh_access_token(client, cfg["pixiv_refresh_token"])
-        pools = build_pools(client, token, cfg["artists"], set(posted), int(conf["pool_pages"]))
+        pools = build_pools(client, token, cfg["artists"], set(posted), int(conf["pool_pages"]), cfg.get("channel_law"))
         planner = Planner(cfg, conf, client, token, pools, posted, runtime, dict_rows, content_map, adult_set, drop_set, dry, len(existing))
         empty = []
         for slot in open_slots:
@@ -574,14 +592,14 @@ def run_manual(cfg: dict, batch: dict) -> int:
         base = next((a for a in cfg["artists"] if str(a["user_id"]) == uid),
                     {"user_id": uid, "name": (detail.get("user") or {}).get("name", ""), "rules": {}})
         artist = {**base, "rules": deep_merge(base.get("rules") or {}, _overrides(batch.get("overrides") or {}))}
-        rules = resolve_rules(artist)
+        rules = resolve_rules(artist, cfg.get("channel_law"))
 
         item = _annotate(adapt_list_item(detail), rules)
         pools = {uid: {"artist": artist, "rules": rules, "items": []}}
         if item["_nsfw"] and item["_method"] == "post" and get_rule(rules, "nsfw_cover", default="own") == "sfw":
             wanted = [uid] + [str(x) for x in get_rule(rules, "sfw_fallback", default=[])]
             arts = [artist] + [a for a in cfg["artists"] if str(a["user_id"]) in wanted and str(a["user_id"]) != uid]
-            pools = build_pools(client, token, arts, set(posted) | {item["id"]}, int(conf["pool_pages"]))
+            pools = build_pools(client, token, arts, set(posted) | {item["id"]}, int(conf["pool_pages"]), cfg.get("channel_law"))
             pools.setdefault(uid, {"artist": artist, "rules": rules, "items": []})
         pools[uid]["rules"] = rules
 
