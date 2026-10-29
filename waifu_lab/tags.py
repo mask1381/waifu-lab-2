@@ -13,9 +13,17 @@ from waifu_lab.config import DATA_DIR
 
 log = logging.getLogger(__name__)
 
-BRAND_TAG = "#WaifuLab"
+_BRAND_TAG = ""
+
+
+def set_brand_tag(tag: str) -> None:
+    """Set dynamic brand tag received from batch/bot."""
+    global _BRAND_TAG
+    _BRAND_TAG = f"#{tag.strip().lstrip('#')}" if (tag and tag.strip()) else ""
+
+
+BRAND_TAG = _BRAND_TAG
 FORMAT_TAGS = {"zip": "#ZIP", "bot": "#Gallery"}
-BRAND_TAG = "#WaifuLab"
 JP_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 PAREN_RE = re.compile(r"^(?P<head>[^()]+?)\s*\((?P<inside>[^()]+)\)\s*$")
 GENERIC_NAMES = {"unknown", "illust", "illustration", "original", "girl", "girls", "character", "anime", "manga", "art", "artwork", "fanart", "general", "waifu"}
@@ -386,7 +394,7 @@ def classify_tags(
             break
 
     # assemble
-    taken = {x.lower() for x in [BRAND_TAG, franchise_ht or ""]}
+    taken = {x.lower() for x in ([_BRAND_TAG] if _BRAND_TAG else []) + [franchise_ht or ""]}
     char_hts: list[str] = []
     char_names: list[str] = []
     for ch in characters:
@@ -430,7 +438,8 @@ def classify_tags(
         hashtags.append(franchise_ht)
     hashtags += char_hts
     hashtags += category
-    hashtags.append(BRAND_TAG)
+    if _BRAND_TAG:
+        hashtags.append(_BRAND_TAG)
 
     final = {h.lower() for h in hashtags}
     decisions = []

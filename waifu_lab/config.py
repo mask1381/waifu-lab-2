@@ -29,10 +29,18 @@ REQUEST_TIMEOUT = 20.0
 
 def env_config(batch: dict) -> dict:
     """Config for one run: secrets from env, everything else (chat, artists, dry) from the batch."""
+    from waifu_lab.caption import set_footer
+    from waifu_lab.tags import set_brand_tag
+
     refresh = (os.getenv("PIXIV_REFRESH_TOKEN") or "").strip()
     bot = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     chat = str(batch.get("target_chat_id") or "").strip()
     dry_run = bool(batch.get("dry"))
+
+    footer = str(batch.get("footer_html") or batch.get("footer") or "").strip()
+    brand_tag = str(batch.get("brand_tag") or "").strip()
+    set_footer(footer)
+    set_brand_tag(brand_tag)
 
     missing = [n for n, v in [("PIXIV_REFRESH_TOKEN", refresh), ("target_chat_id (batch)", chat)] if not v]
     if not bot and not dry_run:

@@ -33,15 +33,14 @@ log = logging.getLogger(__name__)
 FORMATS = ("zip", "album", "bot", "hd")
 CAPTION_LIMIT = 1024
 
-WAIFU_LAB_URL = "https://t.me/+Nt8As_Mw1l0yMGY0"
-FULL_FOOTER = "\n".join(
-    [
-        "𝗧𝗛𝗘 𝗟𝗔𝗕𝗦 ▸",
-        '├─ 🎴 <a href="https://t.me/+2Sf09aP2q903YmI8">𝑨𝒏𝒊𝑾𝒂𝒍𝒍 𝑳𝒂𝒃</a>',
-        f'├─ 🪽 <a href="{WAIFU_LAB_URL}">𝑾𝒂𝒊𝒇𝒖 𝑳𝒂𝒃</a>',
-        '└─ 🌌 <a href="https://t.me/+98kf5lpHI0gzMzNk">𝑨𝒏𝒊𝑵𝒆𝒙𝒖𝒔 𝑳𝒂𝒃</a>',
-    ]
-)
+_DYNAMIC_FOOTER = ""
+
+
+def set_footer(footer: str) -> None:
+    """Set dynamic footer received from batch/bot."""
+    global _DYNAMIC_FOOTER
+    _DYNAMIC_FOOTER = (footer or "").strip()
+
 
 TAG_RE = re.compile(r"<[^>]+>")
 
@@ -136,7 +135,7 @@ def _cta(fmt: str, count: int, page_url, more: bool = False) -> str:
 
 
 def _footer(rules: dict | None) -> str:
-    return "" if get_rule(rules or {}, "caption", "footer", default=True) is False else FULL_FOOTER
+    return "" if get_rule(rules or {}, "caption", "footer", default=True) is False else _DYNAMIC_FOOTER
 
 
 def _assemble(parts: dict, cta: str, tags: list[str], footer: str) -> str:
