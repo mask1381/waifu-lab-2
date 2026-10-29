@@ -28,7 +28,12 @@ DEFAULT_RULES: dict[str, Any] = {
         "merge": {"min": 4, "max": 10, "max_wait_days": 3},
     },
 }
-ALLOWED_KEYS = set(DEFAULT_RULES) | {"caption", "image_edit"}
+ALLOWED_KEYS = set(DEFAULT_RULES) | {"caption", "image_edit", "law_exception", "law"}
+
+def _artist_law_override(artist_rules: dict) -> dict:
+    """۱.۱: استثنای هنرمند = rules.law_exception (legacy: rules.law) — صرف‌اً استثنا، نه لایحه‌ی کانال."""
+    exc = artist_rules.get("law_exception", artist_rules.get("law")) or {}
+    return copy.deepcopy(exc) if isinstance(exc, dict) else {}
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -45,16 +50,23 @@ def deep_merge(base: dict, override: dict) -> dict:
 def resolve_rules(artist: dict, channel_law: dict | None = None) -> dict:
     """Unknown/legacy keys (delivery.*, zip.enabled ...) are dropped on purpose.
     channel_law (لایحه‌ی کانال از بات) به‌عنوان پایه‌ی rules.law می‌نشیند و
-    استثنای هنرمند (rules.law) روی آن اعمال می‌شود.
+    استثنای هنرمند (۱.۱: rules.law_exception، legacy: rules.law) روی آن اعمال می‌شود —
+    پس در خروجی `rules["law"]` همیشه قانون نهایی است.
 
     DEFAULT_RULES is never mutated: each call starts from a fresh copy so successive
     artists / batches cannot leak a previous channel_law into the next one.
     """
+    own = {k: v for k, v in (artist.get("rules") or {}).items() if k in ALLOWED_KEYS}
+    exc = _artist_law_override(own)
     base = deep_merge(DEFAULT_RULES, {})
     if channel_law:
         base["law"] = deep_merge(base["law"], copy.deepcopy(channel_law))
-    own = {k: v for k, v in (artist.get("rules") or {}).items() if k in ALLOWED_KEYS}
-    return deep_merge(base, own)
+    rules = deep_merge(base, own)
+    if "law_exception" in rules:
+        del rules["law_exception"]
+    if exc:
+        rules["law"] = deep_merge(rules["law"], exc)
+    return rules
 
 
 def zip_enabled(rules: dict | None) -> bool:
