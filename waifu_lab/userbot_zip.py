@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import httpx
 
 from waifu_lab.images import IMG_EXT, PXIMG_HEADERS
-from waifu_lab.rules import get_rule, select_pages, zip_allowed
+from waifu_lab.rules import select_pages
 
 log = logging.getLogger(__name__)
 
@@ -169,18 +169,20 @@ def prepare_zip(
 ) -> Path | None:
     """Download pages at original quality into one uncompressed zip. All pages or nothing.
 
-    rules may override:
-      - delivery.allowed / zip.enabled (see rules.zip_allowed: not allowed -> None)
-      - zip.pages ('all' | 1-based int list) which pages to include
+    The caller chooses `zip` as the delivery method (decide() reached the channel-law /
+    artist law_exception threshold). rules may still refine which pages go in:
+      - rules.zip.pages ('all' | 1-based int list) — explicit artist rule
+    When the artist has no explicit zip rule (the zip was requested by the law /
+    استثنای لایحه, e.g. law.zip.nsfw_after), ALL pages are zipped — that is the
+    "minimum zip" the law asked for, and there is no fake "ZIP below" post without a file.
     """
     rules = rules or {}
-    # Last line of defence: even if a caller (gallery, a future path) ends up here
-    # by mistake, no zip is built when the artist's rules do not allow one.
-    if not zip_allowed(rules):
-        log.info("Zip not allowed by artist rules; skipping zip")
-        return None
-
-    chosen_pages = select_pages(pages, get_rule(rules, "zip", "pages", default="all"))
+    zip_rule = rules.get("zip")
+    if isinstance(zip_rule, dict) and zip_rule.get("pages") is not None:
+        pages_spec = zip_rule["pages"]
+    else:
+        pages_spec = "all"                 # لایحه/استثنا زیپ خواسته → همه‌ی صفحات
+    chosen_pages = select_pages(pages, pages_spec)
     if not chosen_pages:
         log.warning("Zip rules selected no pages")
         return None

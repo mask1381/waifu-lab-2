@@ -288,8 +288,15 @@ def deliver_post(prep, when, client, chat_id: str, cover_prep=None) -> int:
         cover = select_page(pages, _cover_spec(rules))
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = prepare_zip(client, pages, prep.chosen["id01"], Path(tmp), rules, name_hint=prep.zip_name)
+            if zip_path is None:
+                # ۵.۱: زیپ ساخته نشده → پست نباید بره. پستی که «ZIP below» وعده می‌دهد ولی
+                # لینک/فایل ندارد، به کانال نمی‌رود (کاندید failed می‌شود و در لاگ می‌آید).
+                raise RuntimeError(
+                    f"zip was not built for {prep.chosen['id01']} (artist rules do not allow a zip "
+                    f"or zip.pages selected nothing); post NOT sent to the channel"
+                )
             blob = _cover_blob(client, cover, rules)
-            link = send_zip_to_storage(zip_path).link if zip_path else None
+            link = send_zip_to_storage(zip_path).link
             ids = schedule_album(chat_id, [blob], prep.make_caption("zip", link), when)
         return len(ids) or 1
 
