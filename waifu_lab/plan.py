@@ -217,7 +217,8 @@ def build_pools(client, token, artists, posted_ids: set[str], pages: int, channe
     return pools
 
 
-def _next_candidate(pools, slot_type: str, blocked: set[str], used_counts: dict, recent: list[str], slot_hhmm: str = ""):
+def _next_candidate(pools, slot_type: str, blocked: set[str], used_counts: dict, recent: list[str], slot_hhmm: str = "", failures: dict | None = None):
+    failures = failures or {}
     rows = []
     for uid, pool in pools.items():
         preferred = get_rule(pool["rules"], "schedule", "preferred_slots", default=None) or []
@@ -231,7 +232,9 @@ def _next_candidate(pools, slot_type: str, blocked: set[str], used_counts: dict,
             continue
         top = max(cands, key=_score)
         last = max((i for i, r in enumerate(recent) if r == uid), default=-1)
-        rows.append(((0 if preferred else 1, used_counts.get(uid, 0), last, -_score(top)), uid, top))
+        # کاندید سالم (بدون سابقهی fail) قبل از کاندیدِ قبلاً شکستخورده اولویت دارد
+        fresh = 0 if top["id"] not in failures else 1
+        rows.append(((0 if preferred else 1, fresh, used_counts.get(uid, 0), last, -_score(top)), uid, top))
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])
@@ -455,7 +458,7 @@ class Planner:
         hhmm = f"{slot.when:%H:%M}"
         for _ in range(MAX_TRIES):
             blocked = self.rejected | self.taken | set(self.posted)
-            pick = _next_candidate(self.pools, slot_type, blocked, self.used_counts, self.recent, hhmm)
+            pick = _next_candidate(self.pools, slot_type, blocked, self.used_counts, self.recent, hhmm, self.runtime.get("failures") or {})
             if pick is None:
                 return False
             uid, cand = pick
@@ -475,7 +478,7 @@ class Planner:
                     self.full = True
                     return False
                 for mid in ids:
-                    _record_failure(self.posted, self.runtime, mid)
+                    _record_failure(self.posted, self.runtime, mid, reason=f"{type(exc).__name__}: {exc}")
                 self.rejected.add(cand["id"])
                 self._save()
                 continue
@@ -504,6 +507,49 @@ def _state(cfg):
     )
     posted = load_posted(cfg["posted_path"]) if "posted_path" in cfg else {}
     return runtime, posted
+
+
+FAILURE_MAX_AGE_DAYS = 7
+FAILURE_MAX_SIZE = 600
+
+
+def _failure_last(rec):
+    """Return the recorded last-failure datetime or None (legacy int / missing)."""
+    if isinstance(rec, dict):
+        stamp = rec.get("last")
+        if stamp:
+            try:
+                return datetime.fromisoformat(str(stamp))
+            except ValueError:
+                return None
+    return None
+
+
+def _prune_failures(runtime: dict) -> None:
+    """Drop stale and over-limit failure records so the map cannot grow forever.
+
+    Records older than FAILURE_MAX_AGE_DAYS are removed. Legacy int records (no
+    timestamp) are kept but still count toward the size cap, which drops the
+    oldest ones first. Pruning runs before a new batch, so only failures that
+    really outlive their purpose are kept.
+    """
+    failures = runtime.get("failures")
+    if not isinstance(failures, dict) or not failures:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(days=FAILURE_MAX_AGE_DAYS)
+    out = {}
+    for item_id, rec in failures.items():
+        last = _failure_last(rec)
+        if last is not None and last < cutoff:
+            continue
+        out[item_id] = rec
+    if len(out) > FAILURE_MAX_SIZE:
+        scored = sorted(
+            out.items(),
+            key=lambda kv: (_failure_last(kv[1]) or datetime.min, kv[0]),
+        )
+        out = dict(scored[-(FAILURE_MAX_SIZE):])
+    runtime["failures"] = out
 
 
 def _data(cfg):
@@ -544,6 +590,7 @@ def run_plan(cfg: dict, dry: bool) -> int:
         return 0
 
     runtime, posted = _state(cfg)
+    _prune_failures(runtime)
     dict_rows, content_map, adult_set, drop_set = _data(cfg)
 
     with httpx.Client(follow_redirects=True, timeout=20.0) as client:
@@ -590,6 +637,7 @@ def run_manual(cfg: dict, batch: dict) -> int:
             when = when.replace(tzinfo=timezone.utc)
     conf = load_schedule()
     runtime, posted = _state(cfg)
+    _prune_failures(runtime)
     dict_rows, content_map, adult_set, drop_set = _data(cfg)
 
     with httpx.Client(follow_redirects=True, timeout=20.0) as client:
@@ -614,9 +662,9 @@ def run_manual(cfg: dict, batch: dict) -> int:
         pools[uid]["items"] = [it for it in pools[uid]["items"] if it["id"] != item["id"]] + [item]
         try:
             res = planner.deliver(uid, item, when, f"manual {iid}")
-        except Exception:
+        except Exception as exc:
             if not dry:
-                _record_failure(posted, runtime, item["id"])
+                _record_failure(posted, runtime, item["id"], reason=f"{type(exc).__name__}: {exc}")
                 planner._save()
             raise
         if res is None:

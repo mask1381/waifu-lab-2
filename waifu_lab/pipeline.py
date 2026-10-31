@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from waifu_lab.blocklist import blocked_reason
 from waifu_lab.caption import build_caption, build_cover_caption, caption_parts
@@ -61,11 +62,24 @@ def _mark_skipped(posted: dict, runtime: dict, item_id: str, reason: str) -> Non
     log.warning("Marked %s as skipped: %s", item_id, reason)
 
 
-def _record_failure(posted: dict, runtime: dict, item_id: str) -> None:
+def _failure_n(value) -> int:
+    """failures[item_id] may be a legacy int or the new {'n': ...} record."""
+    if isinstance(value, dict):
+        return int(value.get("n") or 0)
+    return int(value or 0)
+
+
+def _record_failure(posted: dict, runtime: dict, item_id: str, reason: str = "delivery error") -> None:
     failures = runtime.setdefault("failures", {})
-    failures[item_id] = int(failures.get(item_id, 0)) + 1
-    log.warning("Failure %s/%s for %s", failures[item_id], MAX_FAILURES, item_id)
-    if failures[item_id] >= MAX_FAILURES:
+    n = _failure_n(failures.get(item_id, 0)) + 1
+    reason = str(reason or "").strip() or "delivery error"
+    failures[item_id] = {
+        "n": n,
+        "reason": reason[:300],
+        "last": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    log.warning("Failure %s/%s for %s: %s", n, MAX_FAILURES, item_id, reason)
+    if n >= MAX_FAILURES:
         _mark_skipped(posted, runtime, item_id, f"failed {MAX_FAILURES} times")
 
 
